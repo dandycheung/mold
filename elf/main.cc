@@ -128,7 +128,7 @@ static ObjectFile<E> *new_object_file(Context<E> &ctx, MappedFile *mf,
   file->priority = ctx.file_priority++;
   ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
-    SyncOut(ctx) << "trace: " << *file;
+    Out(ctx) << "trace: " << *file;
   return file;
 }
 
@@ -147,7 +147,7 @@ static ObjectFile<E> *new_lto_obj(Context<E> &ctx, MappedFile *mf,
   file->is_in_lib = ctx.in_lib || (!archive_name.empty() && !ctx.whole_archive);
   file->is_alive = !file->is_in_lib;
   if (ctx.arg.trace)
-    SyncOut(ctx) << "trace: " << *file;
+    Out(ctx) << "trace: " << *file;
   return file;
 }
 
@@ -160,7 +160,7 @@ new_shared_file(Context<E> &ctx, MappedFile *mf) {
   file->priority = ctx.file_priority++;
   ctx.tg.run([file, &ctx] { file->parse(ctx); });
   if (ctx.arg.trace)
-    SyncOut(ctx) << "trace: " << *file;
+    Out(ctx) << "trace: " << *file;
   return file;
 }
 
@@ -434,6 +434,9 @@ int elf_main(int argc, char **argv) {
   // "Kill" .eh_frame input sections after symbol resolution.
   kill_eh_frame_sections(ctx);
 
+  // Split mergeable section contents into section pieces.
+  split_section_pieces(ctx);
+
   // Resolve mergeable section pieces to merge them.
   resolve_section_pieces(ctx);
 
@@ -488,6 +491,10 @@ int elf_main(int argc, char **argv) {
   // Bin input sections into output sections.
   create_output_sections(ctx);
 
+  // Handle --section-align options.
+  if (!ctx.arg.section_align.empty())
+    apply_section_align(ctx);
+
   // Add synthetic symbols such as __ehdr_start or __end.
   add_synthetic_symbols(ctx);
 
@@ -538,8 +545,7 @@ int elf_main(int argc, char **argv) {
 
   // If .ctors/.dtors are to be placed to .init_array/.fini_array,
   // we need to reverse their contents.
-  if (ctx.has_init_array && ctx.has_ctors)
-    fixup_ctors_in_init_array(ctx);
+  fixup_ctors_in_init_array(ctx);
 
   // Handle --shuffle-sections
   if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_NONE)

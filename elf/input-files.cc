@@ -17,7 +17,7 @@ template <typename E>
 Symbol<E> *get_symbol(Context<E> &ctx, std::string_view key,
                       std::string_view name) {
   typename decltype(ctx.symbol_map)::const_accessor acc;
-  ctx.symbol_map.insert(acc, {key, Symbol<E>(name)});
+  ctx.symbol_map.insert(acc, {key, Symbol<E>(name, ctx.arg.demangle)});
   return const_cast<Symbol<E> *>(&acc->second);
 }
 
@@ -50,6 +50,15 @@ std::string_view demangle(const Symbol<E> &sym) {
       return *s;
   }
   return sym.name();
+}
+
+template <typename E>
+std::ostream &operator<<(std::ostream &out, const Symbol<E> &sym) {
+  if (sym.demangle)
+    out << demangle(sym);
+  else
+    out << sym.name();
+  return out;
 }
 
 template <typename E>
@@ -386,11 +395,11 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       if (shdr.sh_type == SHT_INIT_ARRAY ||
           shdr.sh_type == SHT_FINI_ARRAY ||
           shdr.sh_type == SHT_PREINIT_ARRAY)
-        ctx.has_init_array = true;
+        this->has_init_array = true;
 
       if (name == ".ctors" || name.starts_with(".ctors.") ||
           name == ".dtors" || name.starts_with(".dtors."))
-        ctx.has_ctors = true;
+        this->has_ctors = true;
 
       if (name == ".eh_frame")
         eh_frame_sections.push_back(this->sections[i].get());
@@ -668,13 +677,13 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
   }
 }
 
-static size_t find_null(std::string_view data, u64 entsize) {
+static size_t find_null(std::string_view data, i64 pos, i64 entsize) {
   if (entsize == 1)
-    return data.find('\0');
+    return data.find('\0', pos);
 
-  for (i64 i = 0; i <= data.size() - entsize; i += entsize)
-    if (data.substr(i, entsize).find_first_not_of('\0') == data.npos)
-      return i;
+  for (; pos <= data.size() - entsize; pos += entsize)
+    if (data.substr(pos, entsize).find_first_not_of('\0') == data.npos)
+      return pos;
 
   return data.npos;
 }
@@ -699,7 +708,7 @@ static size_t find_null(std::string_view data, u64 entsize) {
 template <typename E>
 static std::unique_ptr<MergeableSection<E>>
 split_section(Context<E> &ctx, InputSection<E> &sec) {
-  if (!sec.is_alive || sec.relsec_idx != -1)
+  if (!sec.is_alive || sec.relsec_idx != -1 || sec.sh_size == 0)
     return nullptr;
 
   const ElfShdr<E> &shdr = sec.shdr();
@@ -717,60 +726,53 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
   if (addralign == 0)
     addralign = 1;
 
-  std::unique_ptr<MergeableSection<E>> rec(new MergeableSection<E>);
-  rec->parent = MergedSection<E>::get_instance(ctx, sec.name(), shdr.sh_type,
-                                               shdr.sh_flags, entsize, addralign);
-  rec->p2align = sec.p2align;
-
-  if (sec.sh_size == 0)
-    return rec;
+  std::unique_ptr<MergeableSection<E>> m(new MergeableSection<E>);
+  m->parent = MergedSection<E>::get_instance(ctx, sec.name(), shdr.sh_type,
+                                             shdr.sh_flags, entsize, addralign);
+  m->p2align = sec.p2align;
 
   // If thes section contents are compressed, uncompress them.
   sec.uncompress(ctx);
 
   std::string_view data = sec.contents;
-  const char *begin = data.data();
-  HyperLogLog estimator;
+  m->contents = sec.contents;
+
+  if (data.size() > UINT32_MAX)
+    Fatal(ctx) << sec << ": mergeable section too large";
 
   // Split sections
   if (shdr.sh_flags & SHF_STRINGS) {
-    while (!data.empty()) {
-      size_t end = find_null(data, entsize);
+    for (i64 pos = 0; pos < data.size();) {
+      m->frag_offsets.push_back(pos);
+      size_t end = find_null(data, pos, entsize);
       if (end == data.npos)
         Fatal(ctx) << sec << ": string is not null terminated";
-
-      std::string_view substr = data.substr(0, end + entsize);
-      data = data.substr(end + entsize);
-
-      rec->strings.push_back(substr);
-      rec->frag_offsets.push_back(substr.data() - begin);
-
-      u64 hash = hash_string(substr);
-      rec->hashes.push_back(hash);
-      estimator.insert(hash);
+      pos = end + entsize;
     }
   } else {
     if (data.size() % entsize)
       Fatal(ctx) << sec << ": section size is not multiple of sh_entsize";
+    m->frag_offsets.reserve(data.size() / entsize);
 
-    while (!data.empty()) {
-      std::string_view substr = data.substr(0, entsize);
-      data = data.substr(entsize);
-
-      rec->strings.push_back(substr);
-      rec->frag_offsets.push_back(substr.data() - begin);
-
-      u64 hash = hash_string(substr);
-      rec->hashes.push_back(hash);
-      estimator.insert(hash);
-    }
+    for (i64 pos = 0; pos < data.size(); pos += entsize)
+      m->frag_offsets.push_back(pos);
   }
 
-  rec->parent->estimator.merge(estimator);
+  // Compute hashes for section pieces
+  HyperLogLog estimator;
+  m->hashes.reserve(m->frag_offsets.size());
+
+  for (i64 i = 0; i < m->frag_offsets.size(); i++) {
+    u64 hash = hash_string(m->get_contents(i));
+    m->hashes.push_back(hash);
+    estimator.insert(hash);
+  }
+
+  m->parent->estimator.merge(estimator);
 
   static Counter counter("string_fragments");
-  counter += rec->fragments.size();
-  return rec;
+  counter += m->frag_offsets.size();
+  return m;
 }
 
 // Usually a section is an atomic unit of inclusion or exclusion.
@@ -832,14 +834,17 @@ template <typename E>
 void ObjectFile<E>::resolve_section_pieces(Context<E> &ctx) {
   for (std::unique_ptr<MergeableSection<E>> &m : mergeable_sections) {
     if (m) {
-      m->fragments.reserve(m->strings.size());
-      for (i64 i = 0; i < m->strings.size(); i++)
-        m->fragments.push_back(m->parent->insert(ctx, m->strings[i], m->hashes[i],
-                                                 m->p2align));
+      m->fragments.reserve(m->frag_offsets.size());
 
-      // Shrink vectors that we will never use again to reclaim memory.
-      m->strings.clear();
+      for (i64 i = 0; i < m->frag_offsets.size(); i++) {
+        SectionFragment<E> *frag =
+          m->parent->insert(ctx, m->get_contents(i), m->hashes[i], m->p2align);
+        m->fragments.push_back(frag);
+      }
+
+      // Reclaim memory as we'll never use this vector again
       m->hashes.clear();
+      m->hashes.shrink_to_fit();
     }
   }
 
@@ -1014,11 +1019,11 @@ template <typename E>
 static void print_trace_symbol(Context<E> &ctx, InputFile<E> &file,
                                const ElfSym<E> &esym, Symbol<E> &sym) {
   if (!esym.is_undef())
-    SyncOut(ctx) << "trace-symbol: " << file << ": definition of " << sym;
+    Out(ctx) << "trace-symbol: " << file << ": definition of " << sym;
   else if (esym.is_weak())
-    SyncOut(ctx) << "trace-symbol: " << file << ": weak reference to " << sym;
+    Out(ctx) << "trace-symbol: " << file << ": weak reference to " << sym;
   else
-    SyncOut(ctx) << "trace-symbol: " << file << ": reference to " << sym;
+    Out(ctx) << "trace-symbol: " << file << ": reference to " << sym;
 }
 
 template <typename E>
@@ -1067,19 +1072,16 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
     if (sym.is_traced)
       print_trace_symbol(ctx, *this, esym, sym);
 
-    if (esym.is_weak())
-      continue;
+    if (sym.file) {
+      bool undef_ref = esym.is_undef() && (!esym.is_weak() || sym.file->is_dso);
+      bool common_ref = esym.is_common() && !sym.esym().is_common();
 
-    if (!sym.file)
-      continue;
-
-    bool keep = esym.is_undef() || (esym.is_common() && !sym.esym().is_common());
-    if (keep && !sym.file->is_alive.test_and_set()) {
-      feeder(sym.file);
-
-      if (sym.is_traced)
-        SyncOut(ctx) << "trace-symbol: " << *this << " keeps " << *sym.file
-                     << " for " << sym;
+      if ((undef_ref || common_ref) && !sym.file->is_alive.test_and_set()) {
+        feeder(sym.file);
+        if (sym.is_traced)
+          Out(ctx) << "trace-symbol: " << *this << " keeps " << *sym.file
+                   << " for " << sym;
+      }
     }
   }
 }
@@ -1148,23 +1150,19 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
       continue;
     }
 
-    elf_sections2.push_back({});
-    ElfShdr<E> &shdr = elf_sections2.back();
-    memset(&shdr, 0, sizeof(shdr));
-
-    if (sym.get_type() == STT_TLS) {
+    ElfShdr<E> shdr = {};
+    if (sym.get_type() == STT_TLS)
       shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_TLS;
-    } else {
+    else
       shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
-    }
 
     shdr.sh_type = SHT_NOBITS;
     shdr.sh_size = this->elf_syms[i].st_size;
     shdr.sh_addralign = this->elf_syms[i].st_value;
+    elf_sections2.push_back(shdr);
 
     i64 idx = this->elf_sections.size() + elf_sections2.size() - 1;
-    std::unique_ptr<InputSection<E>> isec =
-      std::make_unique<InputSection<E>>(ctx, *this, idx);
+    auto isec = std::make_unique<InputSection<E>>(ctx, *this, idx);
 
     sym.file = this;
     sym.set_input_section(isec.get());
@@ -1172,7 +1170,6 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
     sym.sym_idx = i;
     sym.ver_idx = ctx.default_version;
     sym.is_weak = false;
-
     sections.push_back(std::move(isec));
   }
 }
@@ -1296,8 +1293,7 @@ std::ostream &operator<<(std::ostream &out, const InputFile<E> &file) {
 }
 
 template <typename E>
-SharedFile<E> *
-SharedFile<E>::create(Context<E> &ctx, MappedFile *mf) {
+SharedFile<E> *SharedFile<E>::create(Context<E> &ctx, MappedFile *mf) {
   SharedFile<E> *obj = new SharedFile(ctx, mf);
   ctx.dso_pool.emplace_back(obj);
   return obj;
@@ -1403,32 +1399,31 @@ void SharedFile<E>::parse(Context<E> &ctx) {
 // default version of the library) at load-time.
 template <typename E>
 std::vector<std::string_view> SharedFile<E>::read_verdef(Context<E> &ctx) {
-  std::vector<std::string_view> ret(VER_NDX_LAST_RESERVED + 1);
-
   ElfShdr<E> *verdef_sec = this->find_section(SHT_GNU_VERDEF);
   if (!verdef_sec)
-    return ret;
+    return {};
 
   std::string_view verdef = this->get_string(ctx, *verdef_sec);
   std::string_view strtab = this->get_string(ctx, verdef_sec->sh_link);
 
-  ElfVerdef<E> *ver = (ElfVerdef<E> *)verdef.data();
+  std::vector<std::string_view> vec;
+  u8 *ptr = (u8 *)verdef.data();
 
   for (;;) {
+    ElfVerdef<E> *ver = (ElfVerdef<E> *)ptr;
     if (ver->vd_ndx == VER_NDX_UNSPECIFIED)
       Fatal(ctx) << *this << ": symbol version too large";
 
-    if (ret.size() <= ver->vd_ndx)
-      ret.resize(ver->vd_ndx + 1);
+    if (vec.size() <= ver->vd_ndx)
+      vec.resize(ver->vd_ndx + 1);
 
-    ElfVerdaux<E> *aux = (ElfVerdaux<E> *)((u8 *)ver + ver->vd_aux);
-    ret[ver->vd_ndx] = strtab.data() + aux->vda_name;
+    ElfVerdaux<E> *aux = (ElfVerdaux<E> *)(ptr + ver->vd_aux);
+    vec[ver->vd_ndx] = strtab.data() + aux->vda_name;
     if (!ver->vd_next)
       break;
-
-    ver = (ElfVerdef<E> *)((u8 *)ver + ver->vd_next);
+    ptr += ver->vd_next;
   }
-  return ret;
+  return vec;
 }
 
 template <typename E>
@@ -1468,22 +1463,22 @@ SharedFile<E>::mark_live_objects(Context<E> &ctx,
       feeder(sym.file);
 
       if (sym.is_traced)
-        SyncOut(ctx) << "trace-symbol: " << *this << " keeps " << *sym.file
-                     << " for " << sym;
+        Out(ctx) << "trace-symbol: " << *this << " keeps " << *sym.file
+                 << " for " << sym;
     }
   }
 }
 
 template <typename E>
-std::span<Symbol<E> *> SharedFile<E>::find_aliases(Symbol<E> *sym) {
+std::span<Symbol<E> *> SharedFile<E>::get_symbols_at(Symbol<E> *sym) {
   assert(sym->file == this);
 
-  std::call_once(init_aliases, [&] {
+  std::call_once(init_sorted_syms, [&] {
     for (Symbol<E> *sym : this->symbols)
       if (sym->file == this)
-        aliases.push_back(sym);
+        sorted_syms.push_back(sym);
 
-    tbb::parallel_sort(aliases.begin(), aliases.end(),
+    tbb::parallel_sort(sorted_syms.begin(), sorted_syms.end(),
                        [](Symbol<E> *a, Symbol<E> *b) {
       const ElfSym<E> &x = a->esym();
       const ElfSym<E> &y = b->esym();
@@ -1491,9 +1486,9 @@ std::span<Symbol<E> *> SharedFile<E>::find_aliases(Symbol<E> *sym) {
     });
   });
 
-  auto [begin, end] = std::equal_range(aliases.begin(), aliases.end(), sym,
-                                       [&](Symbol<E> *x, Symbol<E> *y) {
-    return x->esym().st_value < y->esym().st_value;
+  auto [begin, end] = std::equal_range(sorted_syms.begin(), sorted_syms.end(),
+                                       sym, [&](Symbol<E> *a, Symbol<E> *b) {
+    return a->esym().st_value < b->esym().st_value;
   });
 
   return {&*begin, (size_t)(end - begin)};
@@ -1555,9 +1550,8 @@ void SharedFile<E>::populate_symtab(Context<E> &ctx) {
   u8 *strtab = ctx.buf + ctx.strtab->shdr.sh_offset;
   i64 strtab_off = this->strtab_offset;
 
-  for (i64 i = 0, j = this->first_global; j < this->elf_syms.size(); i++, j++) {
-    Symbol<E> &sym = *this->symbols[j];
-    if (sym.file != this || !sym.write_to_symtab)
+  for (i64 i = 0; Symbol<E> *sym : this->get_global_syms()) {
+    if (sym->file != this || !sym->write_to_symtab)
       continue;
 
     U32<E> *xindex = nullptr;
@@ -1565,8 +1559,9 @@ void SharedFile<E>::populate_symtab(Context<E> &ctx) {
       xindex = (U32<E> *)(ctx.buf + ctx.symtab_shndx->shdr.sh_offset) +
                this->global_symtab_idx + i;
 
-    *symtab++ = to_output_esym(ctx, sym, strtab_off, xindex);
-    strtab_off += write_string(strtab + strtab_off, sym.name());
+    *symtab++ = to_output_esym(ctx, *sym, strtab_off, xindex);
+    strtab_off += write_string(strtab + strtab_off, sym->name());
+    i++;
   }
 }
 
@@ -1578,6 +1573,7 @@ template class SharedFile<E>;
 template Symbol<E> *get_symbol(Context<E> &, std::string_view, std::string_view);
 template Symbol<E> *get_symbol(Context<E> &, std::string_view);
 template std::string_view demangle(const Symbol<E> &);
+template std::ostream &operator<<(std::ostream &, const Symbol<E> &);
 template std::ostream &operator<<(std::ostream &, const InputFile<E> &);
 
 } // namespace mold::elf

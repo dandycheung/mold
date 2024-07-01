@@ -11,29 +11,29 @@ typedef enum {
   BASEREL, IFUNC_DYNREL,
 } Action;
 
-template <typename E>
-bool CieRecord<E>::equals(const CieRecord<E> &other) const {
-  if (get_contents() != other.get_contents())
-    return false;
-
-  std::span<const ElfRel<E>> x = get_rels();
-  std::span<const ElfRel<E>> y = other.get_rels();
-  if (x.size() != y.size())
-    return false;
-
-  for (i64 i = 0; i < x.size(); i++)
-    if (x[i].r_offset - input_offset != y[i].r_offset - other.input_offset ||
-        x[i].r_type != y[i].r_type ||
-        file.symbols[x[i].r_sym] != other.file.symbols[y[i].r_sym] ||
-        get_addend(input_section, x[i]) != get_addend(other.input_section, y[i]))
-      return false;
-  return true;
-}
-
 static i64 to_p2align(u64 alignment) {
   if (alignment == 0)
     return 0;
   return std::countr_zero(alignment);
+}
+
+template <typename E>
+bool cie_equals(const CieRecord<E> &a, const CieRecord<E> &b) {
+  if (a.get_contents() != b.get_contents())
+    return false;
+
+  std::span<const ElfRel<E>> x = a.get_rels();
+  std::span<const ElfRel<E>> y = b.get_rels();
+  if (x.size() != y.size())
+    return false;
+
+  for (i64 i = 0; i < x.size(); i++)
+    if (x[i].r_offset - a.input_offset != y[i].r_offset - b.input_offset ||
+        x[i].r_type != y[i].r_type ||
+        a.file.symbols[x[i].r_sym] != b.file.symbols[y[i].r_sym] ||
+        get_addend(a.input_section, x[i]) != get_addend(b.input_section, y[i]))
+      return false;
+  return true;
 }
 
 template <typename E>
@@ -69,14 +69,14 @@ void InputSection<E>::uncompress(Context<E> &ctx) {
     return;
 
   u8 *buf = new u8[sh_size];
-  uncompress_to(ctx, buf);
+  copy_contents(ctx, buf);
   contents = std::string_view((char *)buf, sh_size);
   ctx.string_pool.emplace_back(buf);
   uncompressed = true;
 }
 
 template <typename E>
-void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
+void InputSection<E>::copy_contents(Context<E> &ctx, u8 *buf) {
   if (!(shdr().sh_flags & SHF_COMPRESSED) || uncompressed) {
     memcpy(buf, contents.data(), contents.size());
     return;
@@ -104,6 +104,16 @@ void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
     Fatal(ctx) << *this << ": unsupported compression type: 0x"
                << std::hex << hdr.ch_type;
   }
+}
+
+template <typename E>
+static bool
+is_relr_reloc(Context<E> &ctx, InputSection<E> &isec, const ElfRel<E> &rel) {
+  ElfShdr<E> shdr = isec.shdr();
+  return ctx.arg.pack_dyn_relocs_relr &&
+         !(shdr.sh_flags & SHF_EXECINSTR) &&
+         shdr.sh_addralign % sizeof(Word<E>) == 0 &&
+         rel.r_offset % sizeof(Word<E>) == 0;
 }
 
 template <typename E>
@@ -200,7 +210,7 @@ static void scan_rel(Context<E> &ctx, InputSection<E> &isec, Symbol<E> &sym,
   case BASEREL:
     // Create a base relocation.
     check_textrel();
-    if (!isec.is_relr_reloc(ctx, rel))
+    if (!is_relr_reloc(ctx, isec, rel))
       isec.file.num_dynrel++;
     break;
   case IFUNC_DYNREL:
@@ -383,7 +393,7 @@ static void apply_absrel(Context<E> &ctx, InputSection<E> &isec,
     *(Word<E> *)loc = S + A;
     break;
   case BASEREL:
-    if (isec.is_relr_reloc(ctx, rel)) {
+    if (is_relr_reloc(ctx, isec, rel)) {
       *(Word<E> *)loc = S + A;
     } else {
       *dynrel++ = ElfRel<E>(P, E::R_RELATIVE, 0, S + A);
@@ -448,7 +458,7 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
   if constexpr (is_riscv<E>)
     copy_contents_riscv(ctx, buf);
   else
-    uncompress_to(ctx, buf);
+    copy_contents(ctx, buf);
 
   // Apply relocations
   if (!ctx.arg.relocatable) {
@@ -506,22 +516,29 @@ bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
     ss << ">>>               " << file;
     if (std::string_view func = get_func_name(ctx, rel.r_offset); !func.empty())
       ss << ":(" << func << ")";
+    ss << '\n';
 
     typename decltype(ctx.undef_errors)::accessor acc;
     ctx.undef_errors.insert(acc, {&sym, {}});
     acc->second.push_back(ss.str());
   };
 
-  // A non-weak undefined symbol must be promoted to an imported
-  // symbol or resolved to an defined symbol. Otherwise, it's an
-  // undefined symbol error.
+  // A non-weak undefined symbol must be promoted to an imported symbol
+  // or resolved to an defined symbol. Otherwise, we need to report an
+  // error or warn on it.
   //
   // Every ELF file has an absolute local symbol as its first symbol.
   // Referring to that symbol is always valid.
   bool is_undef = esym.is_undef() && !esym.is_weak() && sym.sym_idx;
-  if (!sym.is_imported && is_undef && sym.esym().is_undef()) {
-    record();
-    return true;
+  if (is_undef && sym.esym().is_undef()) {
+    if (ctx.arg.unresolved_symbols == UNRESOLVED_ERROR && !sym.is_imported) {
+      record();
+      return true;
+    }
+    if (ctx.arg.unresolved_symbols == UNRESOLVED_WARN) {
+      record();
+      return false;
+    }
   }
 
   // If a protected/hidden undefined symbol is resolved to other .so,
@@ -537,7 +554,7 @@ bool InputSection<E>::record_undef_error(Context<E> &ctx, const ElfRel<E> &rel) 
 
 using E = MOLD_TARGET;
 
-template struct CieRecord<E>;
+template bool cie_equals(const CieRecord<E> &, const CieRecord<E> &);
 template class InputSection<E>;
 
 } // namespace mold::elf

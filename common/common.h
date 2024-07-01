@@ -2,7 +2,6 @@
 
 #include "integers.h"
 
-#include <array>
 #include <atomic>
 #include <bit>
 #include <bitset>
@@ -65,7 +64,6 @@ using namespace std::literals::string_view_literals;
 template <typename Context> class OutputFile;
 
 inline char *output_tmpfile;
-inline thread_local bool opt_demangle;
 
 inline u8 *output_buffer_start = nullptr;
 inline u8 *output_buffer_end = nullptr;
@@ -85,103 +83,126 @@ static u64 combine_hash(u64 a, u64 b) {
 // Error output
 //
 
-template <typename Context>
-class SyncOut {
+// Some C++ stdlibs don't support std::osyncstream even though
+// it's is in the C++20 standard. So we implement it ourselves.
+class SyncStream {
 public:
-  SyncOut(Context &ctx, std::ostream *out = &std::cout) : out(out) {
-    opt_demangle = ctx.arg.demangle;
+  SyncStream(std::ostream &out) : out(out) {}
+
+  ~SyncStream() {
+    emit();
   }
 
-  ~SyncOut() {
-    if (out) {
-      std::scoped_lock lock(mu);
-      *out << ss.str() << "\n";
-    }
-  }
-
-  template <class T> SyncOut &operator<<(T &&val) {
-    if (out)
-      ss << std::forward<T>(val);
+  template <typename T> SyncStream &operator<<(T &&val) {
+    ss << std::forward<T>(val);
     return *this;
   }
 
-  static inline std::mutex mu;
+  void emit() {
+    if (emitted)
+      return;
+
+    std::scoped_lock lock(mu);
+    out << ss.str() << '\n';
+    emitted = true;
+  }
 
 private:
-  std::ostream *out;
+  std::ostream &out;
   std::stringstream ss;
+  bool emitted = false;
+  static inline std::mutex mu;
 };
 
 template <typename Context>
-static std::string add_color(Context &ctx, std::string msg) {
-  if (ctx.arg.color_diagnostics)
-    return "mold: \033[0;1;31m" + msg + ":\033[0m ";
-  return "mold: " + msg + ": ";
-}
-
-template <typename Context>
-class Fatal {
+class Out {
 public:
-  Fatal(Context &ctx) : out(ctx, &std::cerr) {
-    out << add_color(ctx, "fatal");
-  }
+  Out(Context &ctx) {}
 
-  [[noreturn]] ~Fatal() {
-    out.~SyncOut();
-    cleanup();
-    _exit(1);
-  }
-
-  template <class T> Fatal &operator<<(T &&val) {
+  template <typename T> Out &operator<<(T &&val) {
     out << std::forward<T>(val);
     return *this;
   }
 
 private:
-  SyncOut<Context> out;
+  SyncStream out{std::cout};
+};
+
+static std::string_view fatal_mono = "mold: fatal: ";
+static std::string_view fatal_color = "mold: \033[0;1;31mfatal:\033[0m ";
+static std::string_view error_mono = "mold: error: ";
+static std::string_view error_color = "mold: \033[0;1;31merror:\033[0m ";
+static std::string_view warning_mono = "mold: warning: ";
+static std::string_view warning_color = "mold: \033[0;1;35mwarning:\033[0m ";
+
+template <typename Context>
+class Fatal {
+public:
+  Fatal(Context &ctx) {
+    out << (ctx.arg.color_diagnostics ? fatal_color : fatal_mono);
+  }
+
+  [[noreturn]] ~Fatal() {
+    out.emit();
+    cleanup();
+    _exit(1);
+  }
+
+  template <typename T> Fatal &operator<<(T &&val) {
+    out << std::forward<T>(val);
+    return *this;
+  }
+
+private:
+  SyncStream out{std::cerr};
 };
 
 template <typename Context>
 class Error {
 public:
-  Error(Context &ctx) : out(ctx, &std::cerr) {
+  Error(Context &ctx) {
     if (ctx.arg.noinhibit_exec) {
-      out << add_color(ctx, "warning");
+      out << (ctx.arg.color_diagnostics ? warning_color : warning_mono);
     } else {
-      out << add_color(ctx, "error");
+      out << (ctx.arg.color_diagnostics ? error_color : error_mono);
       ctx.has_error = true;
     }
   }
 
-  template <class T> Error &operator<<(T &&val) {
+  template <typename T> Error &operator<<(T &&val) {
     out << std::forward<T>(val);
     return *this;
   }
 
 private:
-  SyncOut<Context> out;
+  SyncStream out{std::cerr};
 };
 
 template <typename Context>
 class Warn {
 public:
-  Warn(Context &ctx)
-    : out(ctx, ctx.arg.suppress_warnings ? nullptr : &std::cerr) {
+  Warn(Context &ctx) {
+    if (ctx.arg.suppress_warnings)
+      return;
+
+    out.emplace(std::cerr);
+
     if (ctx.arg.fatal_warnings) {
-      out << add_color(ctx, "error");
+      *out << (ctx.arg.color_diagnostics ? error_color : error_mono);
       ctx.has_error = true;
     } else {
-      out << add_color(ctx, "warning");
+      *out << (ctx.arg.color_diagnostics ? warning_color : warning_mono);
     }
   }
 
-  template <class T> Warn &operator<<(T &&val) {
-    out << std::forward<T>(val);
+  template <typename T> Warn &operator<<(T &&val) {
+    if (out)
+      *out << std::forward<T>(val);
     return *this;
   }
 
 private:
-  SyncOut<Context> out;
+  std::optional<SyncStream> out;
 };
 
 //
@@ -383,9 +404,9 @@ void update_maximum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
                                        std::memory_order_relaxed));
 }
 
-template <typename T, typename U>
-inline void append(std::vector<T> &vec1, std::vector<U> vec2) {
-  vec1.insert(vec1.end(), vec2.begin(), vec2.end());
+template <typename T>
+inline void append(std::vector<T> &x, const auto &y) {
+  x.insert(x.end(), y.begin(), y.end());
 }
 
 template <typename T>
@@ -490,9 +511,6 @@ inline u64 read_uleb(std::string_view str) {
 }
 
 inline i64 uleb_size(u64 val) {
-#if __GNUC__
-#pragma GCC unroll 8
-#endif
   for (int i = 1; i < 9; i++)
     if (val < (1LL << (7 * i)))
       return i;
@@ -524,6 +542,16 @@ inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
   return false;
 }
 
+static inline void pause() {
+#if defined(__x86_64__)
+  asm volatile("pause");
+#elif defined(__aarch64__)
+  asm volatile("yield");
+#elif defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_8A__)
+  asm volatile("yield");
+#endif
+}
+
 //
 // Concurrent Map
 //
@@ -539,10 +567,20 @@ inline bool remove_prefix(std::string_view &s, std::string_view prefix) {
 template <typename T>
 class ConcurrentMap {
 public:
-  ConcurrentMap() {}
+  ConcurrentMap() = default;
 
   ConcurrentMap(i64 nbuckets) {
     resize(nbuckets);
+  }
+
+  ~ConcurrentMap() {
+    if (entries) {
+#ifdef _WIN32
+      _aligned_free(entries);
+#else
+      munmap(entries, sizeof(Entry) * nbuckets);
+#endif
+    }
   }
 
   // In order to avoid unnecessary cache-line false sharing, we want
@@ -550,34 +588,51 @@ public:
   // power-of-two address.
   struct alignas(32) Entry {
     Atomic<const char *> key;
-    T value;
     u32 keylen;
+    T value;
   };
 
   void resize(i64 nbuckets) {
+    assert(!entries);
     this->nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
+    i64 bufsize = sizeof(Entry) * this->nbuckets;
 
-    // Even though std::aligned_alloc is defined in C++17, MSVC doesn't
-    // seem to provide that function. C11's aligned_alloc may not always be
-    // available. Therefore, we'll align the buffer ourselves.
-    entries_buf.clear();
-    entries_buf.resize(sizeof(Entry) * this->nbuckets + alignof(Entry) - 1);
-    entries = (Entry *)align_to((uintptr_t)&entries_buf[0], alignof(Entry));
+    // Allocate a zero-initialized buffer. We use mmap() if available
+    // because it's faster than malloc() and memset().
+#ifdef _WIN32
+    entries = (Entry *)_aligned_malloc(bufsize, alignof(Entry));
+    memset((void *)entries, 0, bufsize);
+#else
+    entries = (Entry *)mmap(nullptr, bufsize, PROT_READ | PROT_WRITE,
+                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#endif
   }
 
-  std::pair<T *, bool> insert(std::string_view key, u64 hash, const T &val) {
+  std::pair<T *, bool> insert(std::string_view key, u32 hash, const T &val) {
     assert(has_single_bit(nbuckets));
 
-    i64 idx = hash & (nbuckets - 1);
-    i64 retry = 0;
+    i64 begin = hash & (nbuckets - 1);
+    u64 mask = nbuckets / NUM_SHARDS - 1;
 
-    while (retry < MAX_RETRY) {
+    for (i64 i = 0; i < MAX_RETRY; i++) {
+      i64 idx = (begin & ~mask) | ((begin + i) & mask);
       Entry &ent = entries[idx];
-      const char *ptr = nullptr;
-      bool claimed = ent.key.compare_exchange_weak(ptr, (char *)-1,
-                                                   std::memory_order_acquire);
 
-      // If we successfully claimed the ownership of an unused slot,
+      // It seems avoiding compare-and-swap is faster overall at least
+      // on my Zen4 machine, so do it.
+      if (const char *ptr = ent.key.load(std::memory_order_acquire);
+          ptr != nullptr && ptr != (char *)-1) {
+        if (key == std::string_view(ptr, ent.keylen))
+          return {&ent.value, false};
+        continue;
+      }
+
+      // Otherwise, use CAS to atomically claim the ownership of the slot.
+      const char *ptr = nullptr;
+      bool claimed = ent.key.compare_exchange_strong(ptr, (char *)-1,
+                                                     std::memory_order_acquire);
+
+      // If we successfully claimed the ownership of the slot,
       // copy values to it.
       if (claimed) {
         new (&ent.value) T(val);
@@ -585,10 +640,6 @@ public:
         ent.key.store(key.data(), std::memory_order_release);
         return {&ent.value, true};
       }
-
-      // Loop on a spurious failure.
-      if (ptr == nullptr)
-        continue;
 
       // If someone is copying values to the slot, do busy wait.
       while (ptr == (char *)-1) {
@@ -600,11 +651,6 @@ public:
       // looking for.
       if (key == std::string_view(ptr, ent.keylen))
         return {&ent.value, false};
-
-      // Otherwise, move on to the next slot.
-      u64 mask = nbuckets / NUM_SHARDS - 1;
-      idx = (idx & ~mask) | ((idx + 1) & mask);
-      retry++;
     }
 
     assert(false && "ConcurrentMap is full");
@@ -670,19 +716,15 @@ public:
   static constexpr i64 NUM_SHARDS = 16;
   static constexpr i64 MAX_RETRY = 128;
 
-  std::vector<u8> entries_buf;
   Entry *entries = nullptr;
   i64 nbuckets = 0;
-
-private:
-  static void pause() {
-#if defined(__x86_64__)
-    asm volatile("pause");
-#elif defined(__aarch64__)
-    asm volatile("yield");
-#endif
-  }
 };
+
+//
+// random.cc
+//
+
+void get_random_bytes(u8 *buf, i64 size);
 
 //
 // output-file.h
@@ -758,9 +800,7 @@ private:
 
 class HyperLogLog {
 public:
-  HyperLogLog() : buckets(NBUCKETS) {}
-
-  void insert(u32 hash) {
+  void insert(u64 hash) {
     update_maximum(buckets[hash & (NBUCKETS - 1)], std::countl_zero(hash) + 1);
   }
 
@@ -775,7 +815,7 @@ private:
   static constexpr i64 NBUCKETS = 2048;
   static constexpr double ALPHA = 0.79402;
 
-  std::vector<std::atomic_uint8_t> buckets;
+  Atomic<u8> buckets[NBUCKETS];
 };
 
 //
@@ -823,19 +863,15 @@ private:
   void compile();
   void fix_suffix_links(TrieNode &node);
   void fix_values();
+  i64 find_aho_corasick(std::string_view str);
 
   std::vector<std::string> strings;
   std::unique_ptr<TrieNode> root;
   std::vector<std::pair<Glob, i64>> globs;
   std::once_flag once;
   bool is_compiled = false;
+  bool prefix_match = false;
 };
-
-//
-// uuid.cc
-//
-
-std::array<u8, 16> get_uuid_v4();
 
 //
 // filepath.cc
@@ -927,6 +963,8 @@ class MappedFile {
 public:
   ~MappedFile() { unmap(); }
   void unmap();
+  void close_fd();
+  void reopen_fd(const std::string &path);
 
   template <typename Context>
   MappedFile *slice(Context &ctx, std::string name, u64 start, u64 size) {
@@ -971,6 +1009,9 @@ public:
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
   MappedFile *thin_parent = nullptr;
+
+  // For --dependency-file
+  bool is_dependency = true;
 
 #ifdef _WIN32
   HANDLE fd = INVALID_HANDLE_VALUE;

@@ -44,7 +44,7 @@
 # features and behave exactly the same.
 
 cmake_minimum_required(VERSION 3.14)
-project(mold VERSION 2.30.0)
+project(mold VERSION 2.32.1)
 
 include(CMakeDependentOption)
 include(CheckSymbolExists)
@@ -58,7 +58,12 @@ endif()
 
 add_executable(mold)
 target_compile_features(mold PRIVATE cxx_std_20)
-target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
+
+if(MINGW)
+  target_link_libraries(mold PRIVATE dl)
+else()
+  target_link_libraries(mold PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(NOT "${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}" STREQUAL "MSVC")
   target_compile_options(mold PRIVATE
@@ -107,7 +112,7 @@ endif()
 # This option is intended to be used by `./dist.sh` script to create a
 # mold binary that works on various Linux distros. You probably don't
 # need nor want to set this to ON.
-option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and libcrypto" OFF)
+option(MOLD_MOSTLY_STATIC "Statically link libstdc++ and some other libraries" OFF)
 if(MOLD_MOSTLY_STATIC)
   target_link_options(mold PRIVATE -static-libstdc++)
 endif()
@@ -118,6 +123,7 @@ find_package(ZLIB QUIET)
 if(ZLIB_FOUND AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE ZLIB::ZLIB)
 else()
+  set(ZLIB_BUILD_EXAMPLES OFF CACHE INTERNAL "")
   add_subdirectory(third-party/zlib EXCLUDE_FROM_ALL)
   target_include_directories(zlibstatic INTERFACE third-party/zlib
     $<TARGET_PROPERTY:zlibstatic,BINARY_DIR>)
@@ -130,9 +136,14 @@ find_package(BLAKE3 QUIET)
 if(BLAKE3_FOUND AND NOT MOLD_MOSTLY_STATIC)
   target_link_libraries(mold PRIVATE BLAKE3::blake3)
 else()
-  add_subdirectory(third-party/blake3/c EXCLUDE_FROM_ALL)
-  target_link_libraries(mold PRIVATE blake3)
-  target_include_directories(mold PUBLIC third-party/blake3/c)
+  function(mold_add_blake3)
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory(third-party/blake3/c EXCLUDE_FROM_ALL)
+    target_link_libraries(mold PRIVATE blake3)
+    target_include_directories(mold PUBLIC third-party/blake3/c)
+  endfunction()
+
+  mold_add_blake3()
 endif()
 
 # Find zstd compression library. If zstd.h is not found, we compile a
@@ -266,6 +277,12 @@ if(NOT APPLE AND NOT MSVC)
   target_link_options(mold PRIVATE -pthread)
 endif()
 
+# shm_open needs -lrt
+find_library(LIBRT rt)
+if(LIBRT)
+  target_link_libraries(mold PRIVATE rt)
+endif()
+
 check_symbol_exists(madvise sys/mman.h HAVE_MADVISE)
 
 # Create a .cc file containing the current git hash for `mold --version`.
@@ -316,7 +333,7 @@ list(APPEND MOLD_ELF_TEMPLATE_FILES
   elf/tls.cc
   )
 
-if(WIN32)
+if(WIN32 AND NOT MINGW)
   list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-win32.cc)
 else()
   list(APPEND MOLD_ELF_TEMPLATE_FILES elf/lto-unix.cc)
@@ -349,8 +366,8 @@ target_sources(mold PRIVATE
   common/malloc.cc
   common/multi-glob.cc
   common/perf.cc
+  common/random.cc
   common/tar.cc
-  common/uuid.cc
   elf/arch-alpha.cc
   elf/arch-arm32.cc
   elf/arch-arm64.cc
@@ -396,7 +413,7 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING)
-  # Create the ld and ld64 symlinks required for testing
+  # Create the ld symlinks required for testing
   if(NOT WIN32)
     add_custom_command(
       TARGET mold POST_BUILD
@@ -414,13 +431,8 @@ endif()
 if(NOT CMAKE_SKIP_INSTALL_RULES)
   install(TARGETS mold RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(FILES docs/mold.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1/)
-
-  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
-    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
-  endif()
-  if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE.third-party")
-    install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
-  endif()
+  install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  install(FILES "LICENSE.third-party" DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 
   function(mold_install_relative_symlink OLD NEW)
     install(CODE "
