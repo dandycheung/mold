@@ -206,7 +206,6 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ub32 *)loc = S + A;
       break;
     case R_SPARC_PLT64:
-    case R_SPARC_UA64:
     case R_SPARC_REGISTER:
       *(ub64 *)loc = S + A;
       break;
@@ -370,8 +369,9 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       if (sym.has_tlsgd(ctx)) {
         // do nothing
       } else if (sym.has_gottp(ctx)) {
+        u32 rs1 = bits(*(ub32 *)loc, 18, 14);
         u32 rs2 = bits(*(ub32 *)loc, 4, 0);
-        *(ub32 *)loc = 0xd05d'c000 | rs2; // ldx [ %l7 + %reg ], %o0
+        *(ub32 *)loc = 0xd058'0000 | (rs1 << 14) | rs2; // ldx [ %base + %reg ], %o0
       } else {
         u32 rs2 = bits(*(ub32 *)loc, 4, 0);
         *(ub32 *)loc = 0x9001'c000 | rs2; // add %g7, %reg, %o0
@@ -437,6 +437,7 @@ void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
       *(ub32 *)loc = sym.esym().st_size + A;
       break;
     case R_SPARC_64:
+    case R_SPARC_UA64:
     case R_SPARC_TLS_LDO_ADD:
     case R_SPARC_TLS_IE_LD:
     case R_SPARC_TLS_IE_LDX:
