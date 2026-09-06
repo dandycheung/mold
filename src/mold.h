@@ -3924,13 +3924,16 @@ inline bool Symbol<E>::is_absolute() const {
 // output symbol table. Note that a symbol that is merely not exported to
 // the dynamic symbol table is still a global symbol; besides symbols that
 // are local in the input file, only ones hidden by symbol visibility or
-// localized by a version script are demoted.
+// localized by a version script are demoted. Linker-synthesized symbols
+// are the exception; they are local unless we export them.
 template <typename E>
 inline bool Symbol<E>::is_local(Context<E> &ctx) const {
   if (esym().st_bind == STB_LOCAL)
     return true;
   if (ctx.arg.relocatable)
     return false;
+  if (file == ctx.internal_obj)
+    return !is_exported;
   return visibility == STV_HIDDEN || visibility == STV_INTERNAL ||
          ver_idx == VER_NDX_LOCAL;
 }
